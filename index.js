@@ -3,7 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
 const dns = require('dns').promises;
-const https = require('https'); // New import for SSL fix
+const https = require('https');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
@@ -28,21 +28,21 @@ app.get('/', (req, res) => res.send('Scraper is running!'));
 app.post('/scrape', async (req, res) => {
     let { url } = req.body;
 
-    if (!url) return res.status(400).json({ error: 'Missing url' });
+    if (!url) return res.status(200).json({ success: false, error: 'Missing url' }); // CHANGED to 200
     if (!url.startsWith('http')) url = 'https://' + url;
 
     try {
         console.log(`\n--- Starting scrape for: ${url} ---`);
 
-        // 1. SSL FIX: Ignore insecure certificates (fixes 'unable to verify' error)
+        // 1. SSL FIX
         const agent = new https.Agent({  
             rejectUnauthorized: false 
         });
 
-        // 2. STEALTH HEADERS: Look like a real Chrome browser (helps with 403s)
+        // 2. STEALTH HEADERS
         const axiosConfig = {
-            timeout: 20000, // Increased to 20s
-            httpsAgent: agent, // Apply the SSL fix
+            timeout: 20000, 
+            httpsAgent: agent,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -57,10 +57,8 @@ app.post('/scrape', async (req, res) => {
             }
         };
 
-        // Check for Proxy (Optional future-proofing)
         if (process.env.PROXY_URL) {
             console.log("Using Proxy...");
-            // If using proxy, we merge the SSL fix into the proxy agent
             const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL, { rejectUnauthorized: false });
             axiosConfig.httpsAgent = proxyAgent;
             axiosConfig.proxy = false; 
@@ -114,11 +112,13 @@ app.post('/scrape', async (req, res) => {
     } catch (error) {
         console.error(`Error scraping ${url}:`, error.message);
         
-        // Return 500 but include the error message so n8n can see it
-        res.status(500).json({
+        // IMPORTANT CHANGE HERE:
+        // We now return status 200 even if it failed.
+        // This stops n8n from crashing.
+        res.status(200).json({
             success: false,
             url: url,
-            error: error.message,
+            error: error.message, // The error message is still here for you to see
             emails: []
         });
     }

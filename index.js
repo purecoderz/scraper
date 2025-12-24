@@ -2,24 +2,20 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
-const dns = require('dns').promises; // Built-in Node.js module
+const dns = require('dns').promises;
+const https = require('https'); // New import for SSL fix
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 
-// Middleware
 app.use(express.json());
 app.use(cors());
 
-/**
- * HELPER: Validates if a domain has valid Mail Exchange (MX) records.
- * Returns true if the domain can receive email.
- */
+// --- Helper: Validate DNS ---
 async function validateDomain(email) {
     try {
         const domain = email.split('@')[1];
         if (!domain) return false;
-
         const mxRecords = await dns.resolveMx(domain);
         return mxRecords && mxRecords.length > 0;
     } catch (error) {
@@ -27,78 +23,61 @@ async function validateDomain(email) {
     }
 }
 
-/**
- * ROOT ROUTE: Health check
- */
-app.get('/', (req, res) => {
-    res.send('Scraper is running!');
-});
+app.get('/', (req, res) => res.send('Scraper is running!'));
 
-/**
- * SCRAPE ROUTE: The main logic
- */
 app.post('/scrape', async (req, res) => {
     let { url } = req.body;
 
-    // 1. Input Validation
-    if (!url) {
-        return res.status(400).json({ error: 'Missing url' });
-    }
-    if (!url.startsWith('http')) {
-        url = 'https://' + url;
-    }
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+    if (!url.startsWith('http')) url = 'https://' + url;
 
     try {
         console.log(`\n--- Starting scrape for: ${url} ---`);
 
-        // 2. Configure Axios (Stealth Headers)
+        // 1. SSL FIX: Ignore insecure certificates (fixes 'unable to verify' error)
+        const agent = new https.Agent({  
+            rejectUnauthorized: false 
+        });
+
+        // 2. STEALTH HEADERS: Look like a real Chrome browser (helps with 403s)
         const axiosConfig = {
-            timeout: 15000,
+            timeout: 20000, // Increased to 20s
+            httpsAgent: agent, // Apply the SSL fix
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.google.com/',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0'
+                'Sec-Fetch-User': '?1'
             }
         };
 
-        // Check for Proxy in Environment Variables (for Render/Heroku)
+        // Check for Proxy (Optional future-proofing)
         if (process.env.PROXY_URL) {
-            console.log("Using Proxy connection...");
-            const agent = new HttpsProxyAgent(process.env.PROXY_URL);
-            axiosConfig.httpsAgent = agent;
-            axiosConfig.proxy = false; // Disable default axios proxy to use the agent
+            console.log("Using Proxy...");
+            // If using proxy, we merge the SSL fix into the proxy agent
+            const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL, { rejectUnauthorized: false });
+            axiosConfig.httpsAgent = proxyAgent;
+            axiosConfig.proxy = false; 
         }
 
-        // 3. Fetch the Page
         const response = await axios.get(url, axiosConfig);
-        const html = response.data;
-        const $ = cheerio.load(html);
+        const $ = cheerio.load(response.data);
 
-        // 4. Extraction Strategy
-        // Get visible text
+        // --- Extraction Logic ---
         const bodyText = $('body').text();
-        
-        // Get specific mailto links (often hidden in buttons)
         const mailtoLinks = [];
         $('a[href^="mailto:"]').each((i, elem) => {
-            // Clean up 'mailto:user@example.com?subject=...' -> 'user@example.com'
             let email = $(elem).attr('href').replace(/^mailto:/i, '').split('?')[0];
             if (email) mailtoLinks.push(email);
         });
 
-        // Combine sources for regex search
         const contentToSearch = bodyText + " " + mailtoLinks.join(" ");
-
-        // 5. Regex Matching
-        // Matches standard emails. explicitly looks for a dot and at least 2 chars for extension
         const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
         const matches = contentToSearch.match(emailRegex);
 
@@ -106,32 +85,24 @@ app.post('/scrape', async (req, res) => {
         let validEmails = [];
 
         if (matches) {
-            // Deduplicate and lower case
             uniqueEmails = [...new Set(matches.map(e => e.toLowerCase()))];
-
-            // Filter out common false positives (images, scripts, etc.)
             uniqueEmails = uniqueEmails.filter(email => {
                 const invalidExtensions = ['.png', '.jpg', '.jpeg', '.js', '.css', '.svg', '.gif', '.webp', '.woff', '.mp4'];
                 return !invalidExtensions.some(ext => email.endsWith(ext));
             });
 
-            // 6. DNS Validation (Parallel Processing)
             console.log(`Found ${uniqueEmails.length} candidates. Validating DNS...`);
-            
             const validationResults = await Promise.all(
                 uniqueEmails.map(async (email) => {
                     const isValid = await validateDomain(email);
                     return isValid ? email : null;
                 })
             );
-
-            // Remove nulls
             validEmails = validationResults.filter(e => e !== null);
         }
 
         console.log(`Success! Found ${validEmails.length} valid emails.`);
 
-        // 7. Send Response
         res.json({
             success: true,
             url: url,
@@ -143,18 +114,11 @@ app.post('/scrape', async (req, res) => {
     } catch (error) {
         console.error(`Error scraping ${url}:`, error.message);
         
-        // Handle specific Axios errors (like 403 Forbidden)
-        let errorMessage = error.message;
-        if (error.response && error.response.status === 403) {
-            errorMessage = "Access Forbidden (403). The site blocked the scraper.";
-        } else if (error.code === 'ECONNABORTED') {
-            errorMessage = "Request Timed Out. The site took too long to respond.";
-        }
-
+        // Return 500 but include the error message so n8n can see it
         res.status(500).json({
             success: false,
             url: url,
-            error: errorMessage,
+            error: error.message,
             emails: []
         });
     }

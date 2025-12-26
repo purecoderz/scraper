@@ -5,7 +5,7 @@ const cors = require('cors');
 const dns = require('dns').promises;
 const https = require('https');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-const urlParser = require('url'); // Built-in Node module for URL resolution
+const urlParser = require('url');
 
 const app = express();
 app.use(express.json());
@@ -28,7 +28,7 @@ function createAxiosInstance() {
     const agent = new https.Agent({ rejectUnauthorized: false });
     
     const config = {
-        timeout: 15000, // 15 seconds per page
+        timeout: 15000, 
         httpsAgent: agent,
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -74,20 +74,65 @@ function extractEmails(html) {
     });
 }
 
+// --- NEW Helper: Extract Social Media Links ---
+function extractSocials(html) {
+    const $ = cheerio.load(html);
+    const socials = {
+        facebook: [],
+        twitter: [],
+        linkedin: [],
+        instagram: [],
+        youtube: [],
+        tiktok: []
+    };
+
+    $('a').each((i, elem) => {
+        const href = $(elem).attr('href');
+        if (!href) return;
+
+        // Convert to lowercase for checking, but keep original for storage
+        const lowerHref = href.toLowerCase();
+
+        // Basic filtering to avoid "share" links if possible
+        if (lowerHref.includes('share') || lowerHref.includes('intent/tweet')) return;
+
+        if (lowerHref.includes('facebook.com')) socials.facebook.push(href);
+        else if (lowerHref.includes('twitter.com') || lowerHref.includes('x.com')) socials.twitter.push(href);
+        else if (lowerHref.includes('linkedin.com')) socials.linkedin.push(href);
+        else if (lowerHref.includes('instagram.com')) socials.instagram.push(href);
+        else if (lowerHref.includes('youtube.com')) socials.youtube.push(href);
+        else if (lowerHref.includes('tiktok.com')) socials.tiktok.push(href);
+    });
+
+    // Deduplicate each array
+    for (const key in socials) {
+        socials[key] = [...new Set(socials[key])];
+    }
+
+    return socials;
+}
+
+// --- Helper: Merge Social Objects ---
+function mergeSocials(existing, newSocials) {
+    const merged = { ...existing };
+    for (const key in newSocials) {
+        merged[key] = [...new Set([...(merged[key] || []), ...newSocials[key]])];
+    }
+    return merged;
+}
+
 // --- Helper: Find "Contact" Page Link ---
 function findContactLink(html, baseUrl) {
     const $ = cheerio.load(html);
     let contactUrl = null;
 
-    // Look for links containing "Contact" or "About"
     $('a').each((i, elem) => {
         const text = $(elem).text().toLowerCase();
         const href = $(elem).attr('href');
         
         if (href && (text.includes('contact') || text.includes('about') || href.includes('contact'))) {
-            // Resolve relative URLs (e.g., "/contact" -> "https://site.com/contact")
             contactUrl = urlParser.resolve(baseUrl, href);
-            return false; // Stop loop once found
+            return false; 
         }
     });
     return contactUrl;
@@ -98,7 +143,6 @@ app.get('/', (req, res) => res.send('Scraper is running!'));
 app.post('/scrape', async (req, res) => {
     let { url } = req.body;
 
-    // Return 200 even on input error to prevent n8n crash
     if (!url) return res.status(200).json({ success: false, error: 'Missing url' });
     if (!url.startsWith('http')) url = 'https://' + url;
 
@@ -109,28 +153,34 @@ app.post('/scrape', async (req, res) => {
         // 1. Scrape Homepage
         const response = await axiosInstance.get(url);
         let foundEmails = extractEmails(response.data);
-        console.log(`Homepage found: ${foundEmails.length} emails`);
+        let foundSocials = extractSocials(response.data); // <--- Extract Socials Here
+        
+        console.log(`Homepage: ${foundEmails.length} emails, Socials found.`);
 
-        // 2. Deep Crawl Strategy: If 0 emails, try finding a Contact page
+        // 2. Deep Crawl Strategy
         if (foundEmails.length === 0) {
             const contactUrl = findContactLink(response.data, url);
             if (contactUrl) {
                 console.log(`Deep Crawl: Visiting ${contactUrl}`);
                 try {
                     const contactResponse = await axiosInstance.get(contactUrl);
+                    
                     const contactEmails = extractEmails(contactResponse.data);
                     foundEmails = [...foundEmails, ...contactEmails];
-                    console.log(`Contact Page found: ${contactEmails.length} emails`);
+
+                    const contactSocials = extractSocials(contactResponse.data); // <--- Extract Socials on Contact pg
+                    foundSocials = mergeSocials(foundSocials, contactSocials); // <--- Merge results
+
+                    console.log(`Contact Page: ${contactEmails.length} emails found.`);
                 } catch (err) {
                     console.log(`Failed to scrape contact page: ${err.message}`);
-                    // Swallow error, we just return what we have (empty)
                 }
             } else {
                 console.log("No 'Contact' link found on homepage.");
             }
         }
 
-        // Deduplicate again after deep crawl
+        // Deduplicate emails
         foundEmails = [...new Set(foundEmails)];
 
         // 3. DNS Validation
@@ -153,18 +203,19 @@ app.post('/scrape', async (req, res) => {
             url: url,
             candidates_found: foundEmails.length,
             valid_emails_count: validEmails.length,
-            emails: validEmails
+            emails: validEmails,
+            social_media: foundSocials // <--- Added to response
         });
 
     } catch (error) {
         console.error(`Error scraping ${url}:`, error.message);
         
-        // Return 200 OK so n8n continues flow
         res.status(200).json({
             success: false,
             url: url,
             error: error.message,
-            emails: []
+            emails: [],
+            social_media: {}
         });
     }
 });
